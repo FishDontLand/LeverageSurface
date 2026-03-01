@@ -5,10 +5,6 @@ import bisect
 from scipy.optimize import least_squares
 from scipy.stats import norm
 
-"""
-Local Vol Calibration implemented by following  https://arxiv.org/abs/1512.07660
-"""
-
 class DupireGrid:
     def __init__(self, T_max, y_min, y_max, n_tau, n_y, s_0):
         self.T_max = T_max
@@ -33,11 +29,11 @@ class LocalVariance:
         self.var = var
 
 
-def iv_to_price(spot: float, r:float, strikes: np.array, ivs: np.array, expiries:np.array) -> np.array:
+def iv_to_price(spot: float, r_f:float, r_d:float, strikes: np.array, ivs: np.array, expiries:np.array) -> np.array:
     implied_total_vol = ivs * np.sqrt(expiries)[:, None]
-    d1 = (np.log(spot / strikes) + (r + 0.5 * ivs * ivs) * expiries[:, None]) / implied_total_vol
+    d1 = (np.log(spot / strikes) + (r_d - r_f + 0.5 * ivs * ivs) * expiries[:, None]) / implied_total_vol
     d2 = d1 - implied_total_vol
-    return norm.cdf(d1) * spot - norm.cdf(d2) * strikes * np.exp(-r * expiries)[:, None]
+    return norm.cdf(d1) * spot * np.exp(-r_f * expiries)[:, None] - norm.cdf(d2) * strikes * np.exp(-r_d * expiries)[:, None]
 
 def est_first_order_derivative(xs, ys):
     derivative = np.zeros_like(ys)
@@ -90,8 +86,9 @@ def naive_price_to_local_vol(r_d: float, r_f: float, price_grid: np.array, expir
     time_derivative = est_first_order_derivative(expiries, price_grid.T).T
     strike_curvature = est_second_order_derivative(strikes, price_grid)
     # dupire equation
-    loc_vol = (time_derivative + (r_d - r_f) * strikes * strike_derivative + r_f * price_grid) / (strikes * strikes * strike_curvature) * 2
-    return loc_vol
+    loc_var = (time_derivative + (r_d - r_f) * strikes * strike_derivative + r_f * price_grid) / (strikes * strikes * strike_curvature) * 2
+    loc_var = np.maximum(loc_var, 1e-8)
+    return np.sqrt(loc_var)
 
 
 def get_step_forward_coeffs(current_u, current_a, next_a, b, delta_tau, delta_y, nextL, nextU):
@@ -170,7 +167,7 @@ def forward_solve(var_grid, tau_arr, delta_tau, delta_y, b, u_left, u_right, u_i
 
     return u_grid
 
-def calc_est_price(u_grid, grid_tau, grid_y, s_0, obs_tenors, obs_strikes):
+def _calc_est_price(u_grid, grid_tau, grid_y, s_0, obs_tenors, obs_strikes):
     obs_ys = np.log(obs_strikes / s_0)
     all_est_price = []
     for t in obs_tenors:
@@ -185,7 +182,10 @@ def calc_est_price(u_grid, grid_tau, grid_y, s_0, obs_tenors, obs_strikes):
             est_price = (t - grid_tau[insert_idx]) / (grid_tau[insert_idx - 1] - grid_tau[insert_idx]) * est_price1 + \
                         (t - grid_tau[insert_idx - 1]) / (grid_tau[insert_idx] - grid_tau[insert_idx - 1]) * est_price2
         all_est_price.append(est_price)
-    return np.stack(all_est_price, axis=0)
+    return np.concatenate(all_est_price)
+
+def calc_est_price(u_grid, grid_tau, grid_y, s_0, obs_tenors, obs_strikes):
+    return _calc_est_price(u_grid, grid_tau, obs_tenors, obs_strikes).flatten()
 
 def expand_partial_grid(partial_ys, partial_ts, partial_xs, full_ts, full_xs):
     full_strike_ys = []
@@ -196,44 +196,54 @@ def expand_partial_grid(partial_ys, partial_ts, partial_xs, full_ts, full_xs):
     full_ys = []
     for i in range(len(full_ts)):
         tenor = full_ts[i]
-        while j < len(partial_ts) and partial_ts[j] < tenor:
+        while j < len(partial_ts) - 1 and partial_ts[j] < tenor:
             j += 1
         full_ys.append(full_strike_ys[j])
 
     return np.stack(full_ys, axis=0)
 
 def calibrate_local_vol(obs_price, obs_tenors, obs_strikes, s_0, r_d, r_f, y_min, y_max, tau_max, n_tau, n_y,
-                        benchmarking=False):
+                        benchmarking=False, reg=0.01):
+    obs_price_flatten = obs_price.flatten()
     dupire_grid = DupireGrid(tau_max, y_min, y_max, n_tau, n_y, s_0)
-    adj_strikes = np.log(obs_strikes / s_0)
     left_boundary = s_0 * np.exp(-r_f * dupire_grid.tau)
     right_boundary = np.zeros(len(dupire_grid.tau))
     price_at_expiry = s_0 * np.maximum(1.0 - np.exp(dupire_grid.y), 0.0)
 
     init_local_vol = naive_price_to_local_vol(r_d, r_f, obs_price, obs_tenors, obs_strikes)
-    init_local_var = init_local_vol ** 2
+    init_local_vol = np.maximum(init_local_vol, 1e-8).flatten()
 
     def residual(x):
-        x = x.reshape(len(obs_tenors), len(obs_strikes))
-        var_surface = expand_partial_grid(x * x, obs_tenors, adj_strikes, dupire_grid.tau, dupire_grid.y)
+        local_vol_surface = x.reshape(len(obs_tenors), len(obs_strikes))
+        var_surface = expand_partial_grid(local_vol_surface * local_vol_surface, obs_tenors, obs_strikes, dupire_grid.tau, s_0 * np.exp(dupire_grid.y))
         full_price_grid = forward_solve(var_surface, dupire_grid.tau, dupire_grid.dt, dupire_grid.dy, r_d - r_f,
                                         u_left=left_boundary, u_right=right_boundary, u_init=price_at_expiry)
-        est_price = calc_est_price(full_price_grid, dupire_grid.tau, dupire_grid.y, s_0, obs_tenors, obs_strikes)
-        return (est_price - obs_price).flatten()
+        est_price = _calc_est_price(full_price_grid, dupire_grid.tau, dupire_grid.y, s_0, obs_tenors, obs_strikes)
+        return np.concatenate([est_price - obs_price_flatten, reg * (x - init_local_vol)])
 
     if benchmarking:
         start = timeit.default_timer()
     res = least_squares(
         fun=residual,
-        x0=init_local_var.flatten(),
+        x0=init_local_vol,
         method='lm',
-        max_nfev=1000
+        max_nfev=500
     )
     if benchmarking:
         end = timeit.default_timer()
         print("calibration time: ", end - start)
 
     return np.abs(res.x.reshape(len(obs_tenors), len(obs_strikes)))
+
+if __name__ == '__main__':
+    # used for local test
+    expand_partial_grid(
+        partial_ys=np.random.randn(4, 3),
+        partial_ts=np.array([1,2,3,4]),
+        partial_xs=np.array([0.5, 1, 1.5]),
+        full_ts = np.arange(6),
+        full_xs = np.arange(5) * 0.5
+    )
 
 
 
