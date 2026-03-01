@@ -62,8 +62,7 @@ def _simulate_prices_from_calibrated_local_vol(
 
 
 
-def test_calibrate_local_vol_mc_reprices_input_fx_grid():
-    # FX context: EURUSD-like spot and strike/tenor ladder.
+def test_calibrate_local_vol():
     s0 = 1.10
     r_d = 0.035
     r_f = 0.015
@@ -71,8 +70,6 @@ def test_calibrate_local_vol_mc_reprices_input_fx_grid():
     obs_tenors = np.array([1, 2, 3])
     obs_strikes = np.array([0.85, 1.00, 1.25, 1.30, 1.35, 1.40, 1.45])
 
-    # Input market prices only (derived from an FX-style implied-vol smile per tenor).
-    # Calibration should infer local variance from these prices.
     obs_ivs = np.array(
         [
             [0.125, 0.118, 0.112, 0.110, 0.112, 0.118, 0.130],
