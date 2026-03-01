@@ -1,3 +1,5 @@
+import timeit
+
 import numpy as np
 import bisect
 from scipy.optimize import least_squares
@@ -32,11 +34,10 @@ class LocalVariance:
 
 
 def iv_to_price(spot: float, r:float, strikes: np.array, ivs: np.array, expiries:np.array) -> np.array:
-    implied_total_vol = ivs * np.sqrt(expiries)
-    implied_total_vol = implied_total_vol[:, None]
-    d1 = (np.log(spot / strikes) + (r + 0.5 * ivs * ivs) * expiries) / implied_total_vol
+    implied_total_vol = ivs * np.sqrt(expiries)[:, None]
+    d1 = (np.log(spot / strikes) + (r + 0.5 * ivs * ivs) * expiries[:, None]) / implied_total_vol
     d2 = d1 - implied_total_vol
-    return norm.cdf(d1) * spot - norm.cdf(d2) * strikes * np.exp(-r * expiries)
+    return norm.cdf(d1) * spot - norm.cdf(d2) * strikes * np.exp(-r * expiries)[:, None]
 
 def est_first_order_derivative(xs, ys):
     derivative = np.zeros_like(ys)
@@ -49,7 +50,7 @@ def est_first_order_derivative(xs, ys):
     coeff2 = (current_step_size - prev_step_size) / prev_step_size / current_step_size
     coeff3 = current_step_size  / (prev_step_size + current_step_size) / prev_step_size
 
-    derivative[:, 1:ys.shape[1] - 1] = coeff1 * ys[:, 2:] + coeff2 * ys[:, 1:-1] + coeff3 * ys[:, 0]
+    derivative[:, 1:ys.shape[1] - 1] = coeff1 * ys[:, 2:] + coeff2 * ys[:, 1:-1] + coeff3 * ys[:, :-2]
     derivative[:, 0] = (ys[:,1] - ys[:, 0]) / step_size[0]
     derivative[:, -1] = (ys[:, -2] - ys[:, -1]) / -(step_size[-1])
 
@@ -153,6 +154,7 @@ def step_forward(current_u, current_a, next_a, delta_tau, delta_y, nextL, nextU,
 
 # crank-nelson to solve
 def forward_solve(var_grid, tau_arr, delta_tau, delta_y, b, u_left, u_right, u_init):
+    a_grid = var_grid / 2
     u_grid = np.zeros_like(var_grid)
     u_grid[:, 0] = u_left
     u_grid[:, -1] = u_right
@@ -162,7 +164,7 @@ def forward_solve(var_grid, tau_arr, delta_tau, delta_y, b, u_left, u_right, u_i
             current_u[0] = u_left[0]
             current_u[-1] = u_right[0]
         else:
-            current_u = step_forward(current_u, var_grid[i - 1,:], var_grid[i, :], delta_tau, delta_y, u_left[i],
+            current_u = step_forward(current_u, a_grid[i - 1,:], a_grid[i, :], delta_tau, delta_y, u_left[i],
                                      u_right[i], b)
         u_grid[i, :] = current_u
 
@@ -200,7 +202,8 @@ def expand_partial_grid(partial_ys, partial_ts, partial_xs, full_ts, full_xs):
 
     return np.stack(full_ys, axis=0)
 
-def calibrate_local_vol(obs_price, obs_tenors, obs_strikes, s_0, r_d, r_f, y_min, y_max, tau_max, n_tau, n_y):
+def calibrate_local_vol(obs_price, obs_tenors, obs_strikes, s_0, r_d, r_f, y_min, y_max, tau_max, n_tau, n_y,
+                        benchmarking=False):
     dupire_grid = DupireGrid(tau_max, y_min, y_max, n_tau, n_y, s_0)
     adj_strikes = np.log(obs_strikes / s_0)
     left_boundary = s_0 * np.exp(-r_f * dupire_grid.tau)
@@ -208,23 +211,29 @@ def calibrate_local_vol(obs_price, obs_tenors, obs_strikes, s_0, r_d, r_f, y_min
     price_at_expiry = s_0 * np.maximum(1.0 - np.exp(dupire_grid.y), 0.0)
 
     init_local_vol = naive_price_to_local_vol(r_d, r_f, obs_price, obs_tenors, obs_strikes)
+    init_local_var = init_local_vol ** 2
 
     def residual(x):
         x = x.reshape(len(obs_tenors), len(obs_strikes))
-        var_surface = expand_partial_grid(x, obs_tenors, adj_strikes, dupire_grid.tau, dupire_grid.y)
+        var_surface = expand_partial_grid(x * x, obs_tenors, adj_strikes, dupire_grid.tau, dupire_grid.y)
         full_price_grid = forward_solve(var_surface, dupire_grid.tau, dupire_grid.dt, dupire_grid.dy, r_d - r_f,
                                         u_left=left_boundary, u_right=right_boundary, u_init=price_at_expiry)
         est_price = calc_est_price(full_price_grid, dupire_grid.tau, dupire_grid.y, s_0, obs_tenors, obs_strikes)
         return (est_price - obs_price).flatten()
 
+    if benchmarking:
+        start = timeit.default_timer()
     res = least_squares(
         fun=residual,
-        x0=init_local_vol.flatten(),
+        x0=init_local_var.flatten(),
         method='lm',
-        max_nfev=5000
+        max_nfev=1000
     )
+    if benchmarking:
+        end = timeit.default_timer()
+        print("calibration time: ", end - start)
 
-    return res.x.reshape(len(obs_tenors), len(obs_strikes))
+    return np.abs(res.x.reshape(len(obs_tenors), len(obs_strikes)))
 
 
 
