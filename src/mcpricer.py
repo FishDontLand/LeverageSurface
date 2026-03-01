@@ -100,34 +100,33 @@ def compute_grad(s_sim: np.array, stressed_s_sim: np.array, step_size: float,
     expected_deriv = pathwise_derivative.mean(axis=0) * df[:, None]
     return expected_deriv
 
+def trans_params(param_trans):
+    rho_max1_trans, rho_max2_trans, rho_max3_trans, rho_max5_trans = param_trans[:4]
+    xi_max1_trans, xi_max2_trans, xi_max3_trans, xi_max5_trans = param_trans[4:8]
+    lamb1_trans, lamb2_trans, lamb3_trans, lamb5_trans = param_trans[8:12]
+    kappa = np.tanh(param_trans[-1]) * 2 + 3
+
+    rho_max1 = np.tanh(rho_max1_trans) * 0.2 - 0.5
+    rho_max2 = np.tanh(rho_max2_trans) * 0.2 - 0.4
+    rho_max3 = np.tanh(rho_max3_trans) * 0.2 - 0.35
+    rho_max5 = np.tanh(rho_max5_trans) * 0.15 - 0.275
+
+    xi_max1 = np.tanh(xi_max1_trans) * 0.3 + 0.45
+    xi_max2 = np.tanh(xi_max2_trans) * 0.25 + 0.375
+    xi_max3 = np.tanh(xi_max3_trans) * 0.25 + 0.325
+    xi_max5 = np.tanh(xi_max5_trans) * 0.2 + 0.25
+
+    lamb1 = np.exp(lamb1_trans) / (np.exp(lamb1_trans) + 1)
+    lamb2 = np.exp(lamb2_trans) / (np.exp(lamb2_trans) + 1)
+    lamb3 = np.exp(lamb3_trans) / (np.exp(lamb3_trans) + 1)
+    lamb5 = np.exp(lamb5_trans) / (np.exp(lamb5_trans) + 1)
+
+    return np.array([rho_max1, rho_max2, rho_max3, rho_max5]), np.array([xi_max1, xi_max2, xi_max3, xi_max5]), np.array([lamb1, lamb2, lamb3, lamb5]), kappa
 
 def calibrate_params(obs_price, tenors, strikes, n_paths, n_steps, r_d, r_f, s_0,
-                     lr=1e-3, beta1=0.9, beta2=0.999, weight_decay=0.1, n_iters=1000,
+                     lr=1e-1, beta1=0.8, beta2=0.9, weight_decay=0.1, n_iters=1000,
                      verbose=False):
     STEP_SIZE = 1e-2
-    def trans_params(param_trans):
-        rho_max1_trans, rho_max2_trans, rho_max3_trans, rho_max5_trans = param_trans[:4]
-        xi_max1_trans, xi_max2_trans, xi_max3_trans, xi_max5_trans = param_trans[4:8]
-        lamb1_trans, lamb2_trans, lamb3_trans, lamb5_trans = param_trans[8:12]
-        kappa = np.exp(param_trans[-1])
-
-        rho_max1 = np.tanh(rho_max1_trans) * 0.2 - 0.5
-        rho_max2 = np.tanh(rho_max2_trans) * 0.2 - 0.4
-        rho_max3 = np.tanh(rho_max3_trans) * 0.2 - 0.35
-        rho_max5 = np.tanh(rho_max5_trans) * 0.15 - 0.275
-
-        xi_max1 = np.tanh(xi_max1_trans) * 0.3 + 0.45
-        xi_max2 = np.tanh(xi_max2_trans) * 0.25 + 0.375
-        xi_max3 = np.tanh(xi_max3_trans) * 0.25 + 0.325
-        xi_max5 = np.tanh(xi_max5_trans) * 0.2 + 0.25
-
-        lamb1 = np.exp(lamb1_trans) / (np.exp(lamb1_trans) + 1)
-        lamb2 = np.exp(lamb2_trans) / (np.exp(lamb2_trans) + 1)
-        lamb3 = np.exp(lamb3_trans) / (np.exp(lamb3_trans) + 1)
-        lamb5 = np.exp(lamb5_trans) / (np.exp(lamb5_trans) + 1)
-
-        return np.array([rho_max1, rho_max2, rho_max3, rho_max5]), np.array([xi_max1, xi_max2, xi_max3, xi_max5]), np.array([lamb1, lamb2, lamb3, lamb5]), kappa
-
     current_all_params = np.zeros(13)
 
     (current_rho_max,
@@ -143,14 +142,21 @@ def calibrate_params(obs_price, tenors, strikes, n_paths, n_steps, r_d, r_f, s_0
     m = np.zeros(13)
     v = np.zeros(13)
 
-    for t in range(n_iters):
+    for t_idx in range(n_iters):
+        current_all_params = np.random.normal(size=13)
+        (current_rho_max,
+         current_xi_max,
+         current_lamb,
+         current_kappa) = trans_params(current_all_params)
+        model.set_param(current_rho_max, current_xi_max, current_lamb, current_kappa)
+
         simulations, _ = model.simulate()
         pvs = compute_pvs(simulations, model.times, r_d, tenors, strikes)
 
         if verbose:
-            print('Iteration %d' % t)
-            print('loss: ', np.sqrt(((pvs - obs_price) ** 2).mean()))
-
+            loss = np.sqrt(((pvs - obs_price) ** 2).mean())
+            print('Iteration ', t_idx + 1)
+            print('loss: ', loss)
         g = np.zeros(len(current_all_params))
         for i in range(len(current_all_params)):
             stressed_trans_params = current_all_params.copy()
@@ -164,11 +170,79 @@ def calibrate_params(obs_price, tenors, strikes, n_paths, n_steps, r_d, r_f, s_0
 
         m = beta1 * m + (1 - beta1) * g
         v = beta2 * v + (1 - beta2) * g**2
-        adj_lr = lr * np.sqrt(1 - beta2 ** t)
-        current_all_params = current_all_params - adj_lr * m / (np.sqrt(v) + 1e-6)
+        t = t_idx + 1
+        m_hat = m / (1 - beta1 ** t)
+        v_hat = v / (1 - beta2 ** t)
+        current_all_params = current_all_params - lr * m_hat / (np.sqrt(v_hat) + 1e-6)
         current_all_params = current_all_params - lr * weight_decay * current_all_params
 
-    return current_all_params
+    return current_all_params, model
+
+def simulate_with_leverage_surface(leverage_surface, tenors, strikes, base_model):
+    v_sim = np.empty([base_model.n_paths, base_model.n_steps + 1])
+    s_sim = np.empty([base_model.n_paths, base_model.n_steps + 1])
+    v_sim[:, 0] = base_model.v0
+    s_sim[:, 0] = base_model.s0
+    sqrt_dt = np.sqrt(base_model.dt)
+
+    j = 0
+    for i in range(base_model.n_steps):
+        t = i * base_model.dt
+        while j < len(tenors) - 1 and t > tenors[j]:
+            j += 1
+        xi = base_model.max_xi_ts.value_at(t) * base_model.lamb_ts.value_at(t)
+        dw2 = base_model.sim_cache[:, i, 1] * sqrt_dt
+        rho = base_model.max_rho_ts.value_at(t) * base_model.lamb_ts.value_at(t)
+        dw1 = base_model.sim_cache[:, i, 0] * sqrt_dt * np.sqrt(1 - rho * rho) + rho * dw2
+
+        v_sim[:, i + 1] = v_sim[:, i] + base_model.kappa * (1.0 - v_sim[:, i]) * base_model.dt + \
+                          xi * v_sim[:, i] * dw2 + 0.5 * (xi * xi) * v_sim[:, i] * (dw2 * dw2 - base_model.dt)
+
+        v_sim[:, i + 1] = np.maximum(v_sim[:, i + 1], base_model.v_floor)
+        leverage_surface_slice = np.interp(v_sim[:, i], strikes, leverage_surface[j, :])
+        s_sim[:, i + 1] = s_sim[:, i] * np.exp(
+            (base_model.mu - 0.5 * v_sim[:, i] * v_sim[:, i]) * base_model.dt + leverage_surface_slice * v_sim[:, i] * dw1)
+    return s_sim, v_sim
+
+def calc_stoch_var_cond_exp(leverage_surface, s_sim, v_sim, sim_times, sim_strikes, tenors, strikes):
+    insert_idx = np.searchsorted(sim_times, tenors)
+
+    if min(insert_idx) == 0 or max(insert_idx) == len(sim_times):
+        raise ValueError('Leverage Surface tenors out of simulation range')
+
+    assert np.max(np.abs(sim_times[insert_idx] - tenors)) < 1e-8, "leverage surface tenor not on simulation time grid"
+
+    s_sim_at_tenor = s_sim[:, insert_idx]
+    v_sim_at_tenor = v_sim[:, insert_idx]
+
+    sim_strikes_max = sim_strikes[-1]
+    sim_strikes_min = sim_strikes[0]
+    num_segments = 100
+    radius = (sim_strikes_max - sim_strikes_min) / num_segments / 2
+
+    conditional_expectations = []
+    for idx, s in enumerate(strikes):
+        condition = (s_sim_at_tenor > s - radius) & (s_sim_at_tenor < s + radius)
+        leverage = leverage_surface[:, idx]
+        vt_square_avg = np.nanmean(np.where(condition, v_sim_at_tenor * v_sim_at_tenor, np.nan), axis=1)
+        conditional_expectations.append(vt_square_avg)
+
+    return np.stack(conditional_expectations, axis=0)
+
+def calibrate_leverage_surface(local_vol, base_model, sim_times, sim_strikes, tenors, strikes, num_iters):
+    leverage_surface = np.ones([len(tenors), len(strikes)])
+    for i in range(num_iters):
+        s_sim, v_sim = simulate_with_leverage_surface(leverage_surface, tenors, strikes, base_model)
+        cond_exp = calc_stoch_var_cond_exp(leverage_surface, s_sim, v_sim, sim_times, sim_strikes, tenors, strikes)
+        new_leverage_surface = local_vol / np.maximum(np.sqrt(cond_exp), 1e-6)
+        diff = (new_leverage_surface - leverage_surface)
+        if np.sqrt((diff * diff).mean()) < 0.05:
+            break
+    return leverage_surface
+
+if __name__ == '__main__':
+    # for quick local test
+    calibrate_params()
 
 
 
