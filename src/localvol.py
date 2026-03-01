@@ -34,9 +34,9 @@ class LocalVariance:
 def iv_to_price(spot: float, r:float, strikes: np.array, ivs: np.array, expiries:np.array) -> np.array:
     implied_total_vol = ivs * np.sqrt(expiries)
     implied_total_vol = implied_total_vol[:, None]
-    d1 = (np.log(spot / strikes) + (r + ivs * ivs) * expiries) / implied_total_vol
+    d1 = (np.log(spot / strikes) + (r + 0.5 * ivs * ivs) * expiries) / implied_total_vol
     d2 = d1 - implied_total_vol
-    return norm.cdf(d1) * spot - norm.cdf(d2) * strikes * expiries
+    return norm.cdf(d1) * spot - norm.cdf(d2) * strikes * np.exp(-r * expiries)
 
 def est_first_order_derivative(xs, ys):
     derivative = np.zeros_like(ys)
@@ -85,9 +85,9 @@ def est_second_order_derivative(xs, ys):
     return second_order_derivative
 
 def naive_price_to_local_vol(r_d: float, r_f: float, price_grid: np.array, expiries: np.array, strikes: np.array) -> np.array:
-    strike_derivative = est_first_order_derivative(price_grid, strikes)
-    time_derivative = est_first_order_derivative(price_grid.T, expiries).T
-    strike_curvature = est_second_order_derivative(price_grid, strikes)
+    strike_derivative = est_first_order_derivative(strikes, price_grid)
+    time_derivative = est_first_order_derivative(expiries, price_grid.T).T
+    strike_curvature = est_second_order_derivative(strikes, price_grid)
     # dupire equation
     loc_vol = (time_derivative + (r_d - r_f) * strikes * strike_derivative + r_f * price_grid) / (strikes * strikes * strike_curvature) * 2
     return loc_vol
@@ -185,7 +185,7 @@ def calc_est_price(u_grid, grid_tau, grid_y, s_0, obs_tenors, obs_strikes):
         all_est_price.append(est_price)
     return np.stack(all_est_price, axis=0)
 
-def expand_local_var(partial_ys, partial_ts, partial_xs, full_ts, full_xs):
+def expand_partial_grid(partial_ys, partial_ts, partial_xs, full_ts, full_xs):
     full_strike_ys = []
     for i in range(len(partial_ts)):
         full_strike_ys.append(np.interp(full_xs, partial_xs, partial_ys[i]))
@@ -198,28 +198,28 @@ def expand_local_var(partial_ys, partial_ts, partial_xs, full_ts, full_xs):
             j += 1
         full_ys.append(full_strike_ys[j])
 
-    return np.stack(full_strike_ys, axis=0)
+    return np.stack(full_ys, axis=0)
 
 def calibrate_local_vol(obs_price, obs_tenors, obs_strikes, s_0, r_d, r_f, y_min, y_max, tau_max, n_tau, n_y):
     dupire_grid = DupireGrid(tau_max, y_min, y_max, n_tau, n_y, s_0)
     adj_strikes = np.log(obs_strikes / s_0)
     left_boundary = s_0 * np.exp(-r_f * dupire_grid.tau)
-    right_boundary = np.zeros(len(dupire_grid.y))
+    right_boundary = np.zeros(len(dupire_grid.tau))
     price_at_expiry = s_0 * np.maximum(1.0 - np.exp(dupire_grid.y), 0.0)
 
     init_local_vol = naive_price_to_local_vol(r_d, r_f, obs_price, obs_tenors, obs_strikes)
 
     def residual(x):
         x = x.reshape(len(obs_tenors), len(obs_strikes))
-        var_surface = expand_local_var(x, obs_tenors, adj_strikes, dupire_grid.tau, dupire_grid.y)
+        var_surface = expand_partial_grid(x, obs_tenors, adj_strikes, dupire_grid.tau, dupire_grid.y)
         full_price_grid = forward_solve(var_surface, dupire_grid.tau, dupire_grid.dt, dupire_grid.dy, r_d - r_f,
                                         u_left=left_boundary, u_right=right_boundary, u_init=price_at_expiry)
-        est_price = calc_est_price(full_price_grid, dupire_grid.tau, dupire_grid.y, obs_tenors, obs_strikes)
+        est_price = calc_est_price(full_price_grid, dupire_grid.tau, dupire_grid.y, s_0, obs_tenors, obs_strikes)
         return (est_price - obs_price).flatten()
 
     res = least_squares(
         fun=residual,
-        x0=init_local_vol,
+        x0=init_local_vol.flatten(),
         method='lm',
         max_nfev=5000
     )
