@@ -184,9 +184,6 @@ def _calc_est_price(u_grid, grid_tau, grid_y, s_0, obs_tenors, obs_strikes):
         all_est_price.append(est_price)
     return np.concatenate(all_est_price)
 
-def calc_est_price(u_grid, grid_tau, grid_y, s_0, obs_tenors, obs_strikes):
-    return _calc_est_price(u_grid, grid_tau, obs_tenors, obs_strikes).flatten()
-
 def expand_partial_grid(partial_ys, partial_ts, partial_xs, full_ts, full_xs):
     full_strike_ys = []
     for i in range(len(partial_ts)):

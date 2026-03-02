@@ -1,5 +1,8 @@
 import numpy as np
 
+from src.localvol import calibrate_local_vol, iv_to_price
+
+
 class PiecewiseTermStructure:
     def __init__(self, xs, ys):
         self.xs = xs
@@ -143,7 +146,6 @@ def calibrate_params(obs_price, tenors, strikes, n_paths, n_steps, r_d, r_f, s_0
     v = np.zeros(13)
 
     for t_idx in range(n_iters):
-        current_all_params = np.random.normal(size=13)
         (current_rho_max,
          current_xi_max,
          current_lamb,
@@ -176,6 +178,9 @@ def calibrate_params(obs_price, tenors, strikes, n_paths, n_steps, r_d, r_f, s_0
         current_all_params = current_all_params - lr * m_hat / (np.sqrt(v_hat) + 1e-6)
         current_all_params = current_all_params - lr * weight_decay * current_all_params
 
+    final_rho_max, final_xi_max, final_lamb, final_kappa = trans_params(current_all_params)
+    model.set_param(final_rho_max, final_xi_max, final_lamb, final_kappa)
+
     return current_all_params, model
 
 def simulate_with_leverage_surface(leverage_surface, tenors, strikes, base_model):
@@ -199,12 +204,13 @@ def simulate_with_leverage_surface(leverage_surface, tenors, strikes, base_model
                           xi * v_sim[:, i] * dw2 + 0.5 * (xi * xi) * v_sim[:, i] * (dw2 * dw2 - base_model.dt)
 
         v_sim[:, i + 1] = np.maximum(v_sim[:, i + 1], base_model.v_floor)
-        leverage_surface_slice = np.interp(v_sim[:, i], strikes, leverage_surface[j, :])
+        leverage_surface_slice = np.interp(s_sim[:, i], strikes, leverage_surface[j, :])
         s_sim[:, i + 1] = s_sim[:, i] * np.exp(
-            (base_model.mu - 0.5 * v_sim[:, i] * v_sim[:, i]) * base_model.dt + leverage_surface_slice * v_sim[:, i] * dw1)
+            (base_model.mu - 0.5 * leverage_surface_slice * leverage_surface_slice * v_sim[:, i] * v_sim[:, i]) * base_model.dt + leverage_surface_slice * v_sim[:, i] * dw1)
+
     return s_sim, v_sim
 
-def calc_stoch_var_cond_exp(leverage_surface, s_sim, v_sim, sim_times, sim_strikes, tenors, strikes):
+def calc_stoch_var_cond_exp(s_sim, v_sim, sim_times, tenors, strikes):
     insert_idx = np.searchsorted(sim_times, tenors)
 
     if min(insert_idx) == 0 or max(insert_idx) == len(sim_times):
@@ -215,34 +221,79 @@ def calc_stoch_var_cond_exp(leverage_surface, s_sim, v_sim, sim_times, sim_strik
     s_sim_at_tenor = s_sim[:, insert_idx]
     v_sim_at_tenor = v_sim[:, insert_idx]
 
-    sim_strikes_max = sim_strikes[-1]
-    sim_strikes_min = sim_strikes[0]
+    sim_strikes_max = np.max(s_sim_at_tenor, axis=0)
+    sim_strikes_min = np.min(s_sim_at_tenor, axis=0)
     num_segments = 100
     radius = (sim_strikes_max - sim_strikes_min) / num_segments / 2
 
     conditional_expectations = []
     for idx, s in enumerate(strikes):
         condition = (s_sim_at_tenor > s - radius) & (s_sim_at_tenor < s + radius)
-        leverage = leverage_surface[:, idx]
-        vt_square_avg = np.nanmean(np.where(condition, v_sim_at_tenor * v_sim_at_tenor, np.nan), axis=1)
+        vt_square_avg = np.nanmean(np.where(condition, v_sim_at_tenor * v_sim_at_tenor, np.nan), axis=0)
         conditional_expectations.append(vt_square_avg)
 
-    return np.stack(conditional_expectations, axis=0)
+    return np.stack(conditional_expectations, axis=1)
 
-def calibrate_leverage_surface(local_vol, base_model, sim_times, sim_strikes, tenors, strikes, num_iters):
+def calibrate_leverage_surface_from_base(obs_prices, local_vol, base_model, tenors, strikes, num_iters,
+                                         verbose=False):
     leverage_surface = np.ones([len(tenors), len(strikes)])
-    for i in range(num_iters):
-        s_sim, v_sim = simulate_with_leverage_surface(leverage_surface, tenors, strikes, base_model)
-        cond_exp = calc_stoch_var_cond_exp(leverage_surface, s_sim, v_sim, sim_times, sim_strikes, tenors, strikes)
-        new_leverage_surface = local_vol / np.maximum(np.sqrt(cond_exp), 1e-6)
-        diff = (new_leverage_surface - leverage_surface)
-        if np.sqrt((diff * diff).mean()) < 0.05:
+    lamb=5e-1
+    diffs = []
+    i = 0
+    s_sim, v_sim = simulate_with_leverage_surface(leverage_surface, tenors, strikes, base_model)
+    cond_exp = calc_stoch_var_cond_exp(s_sim, v_sim, base_model.times, tenors, strikes)
+    pvs = compute_pvs(s_sim, base_model.times, r_d, tenors, strikes)
+    loss = np.sqrt(((pvs - obs_prices) ** 2).mean())
+    while i < num_iters:
+        if lamb < 1e-5:
             break
-    return leverage_surface
+        new_leverage_surface = (1 - lamb) * leverage_surface + lamb * local_vol / np.maximum(np.sqrt(cond_exp), 1e-6)
+        s_sim, v_sim = simulate_with_leverage_surface(new_leverage_surface, tenors, strikes, base_model)
+        cond_exp = calc_stoch_var_cond_exp(s_sim, v_sim, base_model.times, tenors, strikes)
+        if np.isnan(cond_exp.any()).any():
+            lamb /= 2
+            continue
+        pvs = compute_pvs(s_sim, base_model.times, r_d, tenors, strikes)
+        new_loss = np.sqrt(((pvs - obs_prices) ** 2).mean())
+        if new_loss > loss:
+            lamb /= 2
+            continue
+        loss = new_loss
+        if verbose:
+            print(f"Iteration {i + 1}, loss: {loss:.4}")
+        diffs.append(np.sqrt(((new_leverage_surface - leverage_surface) ** 2).mean()))
+        leverage_surface = new_leverage_surface
+        i += 1
+
+    return leverage_surface, diffs
+
+def calibrate_leverage_surface(obs_prices, tenors, strikes, s0, r_d, r_f, n_pde_tau, n_pde_strike, n_sim_paths, n_sim_steps):
+    y_min = np.log(np.maximum(np.min(strikes) / s0 - 0.3, 1e-6))
+    y_max = np.log(np.max(strikes) + 0.3)
+
+    calibrated_local_vol = calibrate_local_vol(obs_prices, tenors, strikes, s0,  r_d, r_f,
+                                               y_min, y_max, max(tenors), n_pde_tau, n_pde_strike)
+
+
+    base_model_params, base_model = calibrate_params(obs_price=obs_prices,
+                                                     tenors=tenors,
+                                                     strikes=strikes,
+                                                     n_paths=n_sim_paths,
+                                                     n_steps=n_sim_steps,
+                                                     r_d=r_d, r_f=r_f, s_0=s0, n_iters=60)
+
+    leverage_surface, _ = calibrate_leverage_surface_from_base(calibrated_local_vol,
+                                                            base_model, tenors, strikes, num_iters=100)
+
+    s_sim, _ = simulate_with_leverage_surface(leverage_surface, tenors, strikes, base_model)
+
+    est_pvs = compute_pvs(s_sim, base_model.times, r_d, tenors, strikes)
+
+    return leverage_surface, est_pvs
 
 if __name__ == '__main__':
     # for quick local test
-    calibrate_params()
+    pass
 
 
 
