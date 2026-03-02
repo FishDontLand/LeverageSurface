@@ -3,7 +3,7 @@ from src.mcpricer import (
     MCStochasticVolModel,
     PiecewiseTermStructure,
     compute_pvs,
-    trans_params, calibrate_leverage_surface, simulate_with_leverage_surface,
+    trans_params, calibrate_leverage_surface, simulate_with_leverage_surface, compute_barrier_pvs,
 )
 from src.localvol import iv_to_price, calibrate_local_vol
 
@@ -165,3 +165,64 @@ def test_calibrate_leverage_surface():
                                                            300, 300, 30000, 300)
 
     assert np.sqrt(((est_pvs - obs_prices) ** 2).mean()) < 0.02
+
+
+def test_compute_barrier_pvs1():
+    r_d = 0.03
+    r_f = 0.01
+    s0 = 1.0
+    sigma = 0.25
+    tenors = np.array([1.0, 2.0])
+    strikes = np.array([0.8, 1.0, 1.2])
+
+    n_paths = 150_000
+    n_steps = 200
+    t_max = 2.0
+    dt = t_max / n_steps
+    sim_times = np.linspace(0.0, t_max, n_steps + 1)
+
+    rng = np.random.default_rng(7)
+    z = rng.standard_normal((n_paths, n_steps))
+
+    s_sim = np.empty((n_paths, n_steps + 1))
+    s_sim[:, 0] = s0
+    drift = (r_d - r_f - 0.5 * sigma * sigma) * dt
+    for i in range(n_steps):
+        s_sim[:, i + 1] = s_sim[:, i] * np.exp(drift + sigma * np.sqrt(dt) * z[:, i])
+
+    vanilla_pvs = compute_pvs(s_sim, sim_times, r_d, tenors, strikes)
+    barrier_pvs = compute_barrier_pvs(s_sim, sim_times, r_d, tenors, strikes, B=100)
+
+    np.testing.assert_allclose(barrier_pvs, vanilla_pvs, atol=1e-12, rtol=0.0)
+
+
+def test_compute_barrier_pvs2():
+    r_d = 0.03
+    r_f = 0.01
+    s0 = 1.0
+    sigma = 0.35
+    tenors = np.array([1.0, 2.0, 3, 5])
+    strikes = np.array([0.8, 1.0, 1.2])
+
+    n_paths = 150_000
+    n_steps = 200
+    t_max = 5.0
+    dt = t_max / n_steps
+    sim_times = np.linspace(0.0, t_max, n_steps + 1)
+
+    rng = np.random.default_rng(9)
+    z = rng.standard_normal((n_paths, n_steps))
+
+    s_sim = np.empty((n_paths, n_steps + 1))
+    s_sim[:, 0] = s0
+    drift = (r_d - r_f - 0.5 * sigma * sigma) * dt
+    for i in range(n_steps):
+        s_sim[:, i + 1] = s_sim[:, i] * np.exp(drift + sigma * np.sqrt(dt) * z[:, i])
+
+    high_barrier = compute_barrier_pvs(s_sim, sim_times, r_d, tenors, strikes, B=1.50)
+    mid_barrier = compute_barrier_pvs(s_sim, sim_times, r_d, tenors, strikes, B=1.25)
+    low_barrier = compute_barrier_pvs(s_sim, sim_times, r_d, tenors, strikes, B=1.10)
+
+    assert np.all(high_barrier >= mid_barrier - 1e-12)
+    assert np.all(mid_barrier >= low_barrier - 1e-12)
+    assert np.any(high_barrier > low_barrier + 1e-4)

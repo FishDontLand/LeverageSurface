@@ -86,9 +86,9 @@ def compute_barrier_pvs(s_sim: np.array, sim_times: np.array, r_d: float, tenors
 
     all_pvs = []
     for i, idx in enumerate(insert_idx):
-        max_s = s_sim[:, idx].max(axis=1)
-        s_sim_adj = np.where(max_s < B, s_sim[:, idx], -1.0)
-        payoff = np.maximum(s_sim_adj - strikes, 0.0)
+        max_s = np.max(s_sim[:, :idx + 1], axis=1)
+        payoff = np.maximum(s_sim[:, idx, None] - strikes[None, :], 0.0)
+        payoff[max_s >= B, :] = 0.0
         all_pvs.append(payoff.mean(axis=0) * np.exp(-r_d * tenors[i]))
 
     return np.stack(all_pvs, axis=0)

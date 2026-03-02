@@ -224,7 +224,7 @@ def calibrate_local_vol(obs_price, obs_tenors, obs_strikes, s_0, r_d, r_f, y_min
         fun=residual,
         x0=init_local_vol,
         method='lm',
-        max_nfev=40
+        max_nfev=80
     )
     if benchmarking:
         end = timeit.default_timer()
