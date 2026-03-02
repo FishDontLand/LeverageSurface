@@ -1,3 +1,5 @@
+from deprecated import deprecated
+
 import numpy as np
 
 from src.localvol import calibrate_local_vol, iv_to_price
@@ -126,9 +128,10 @@ def trans_params(param_trans):
 
     return np.array([rho_max1, rho_max2, rho_max3, rho_max5]), np.array([xi_max1, xi_max2, xi_max3, xi_max5]), np.array([lamb1, lamb2, lamb3, lamb5]), kappa
 
-def calibrate_params(obs_price, tenors, strikes, n_paths, n_steps, r_d, r_f, s_0,
-                     lr=1e-1, beta1=0.8, beta2=0.9, weight_decay=0.1, n_iters=1000,
-                     verbose=False):
+@deprecated
+def calibrate_non_leverage_params(obs_price, tenors, strikes, n_paths, n_steps, r_d, r_f, s_0, v0,
+                                  lr=1e-1, beta1=0.8, beta2=0.9, weight_decay=0.1, n_iters=1000,
+                                  verbose=False):
     STEP_SIZE = 1e-2
     current_all_params = np.zeros(13)
 
@@ -137,7 +140,7 @@ def calibrate_params(obs_price, tenors, strikes, n_paths, n_steps, r_d, r_f, s_0
      current_lamb,
      current_kappa) = trans_params(current_all_params)
 
-    model = MCStochasticVolModel(max(tenors), n_paths, n_steps, r_d, r_f, 1, s_0, current_kappa,
+    model = MCStochasticVolModel(max(tenors), n_paths, n_steps, r_d, r_f, v0, s_0, current_kappa,
                                  PiecewiseTermStructure([1, 2, 3, 5], current_rho_max),
                                  PiecewiseTermStructure([1, 2, 3, 5], current_xi_max),
                                  PiecewiseTermStructure([1, 2, 3, 5], current_lamb))
@@ -242,7 +245,7 @@ def calibrate_leverage_surface_from_base(obs_prices, local_vol, base_model, teno
     i = 0
     s_sim, v_sim = simulate_with_leverage_surface(leverage_surface, tenors, strikes, base_model)
     cond_exp = calc_stoch_var_cond_exp(s_sim, v_sim, base_model.times, tenors, strikes)
-    pvs = compute_pvs(s_sim, base_model.times, r_d, tenors, strikes)
+    pvs = compute_pvs(s_sim, base_model.times, base_model.r_d, tenors, strikes)
     loss = np.sqrt(((pvs - obs_prices) ** 2).mean())
     while i < num_iters:
         if lamb < 1e-5:
@@ -253,7 +256,7 @@ def calibrate_leverage_surface_from_base(obs_prices, local_vol, base_model, teno
         if np.isnan(cond_exp.any()).any():
             lamb /= 2
             continue
-        pvs = compute_pvs(s_sim, base_model.times, r_d, tenors, strikes)
+        pvs = compute_pvs(s_sim, base_model.times, base_model.r_d, tenors, strikes)
         new_loss = np.sqrt(((pvs - obs_prices) ** 2).mean())
         if new_loss > loss:
             lamb /= 2
@@ -267,23 +270,21 @@ def calibrate_leverage_surface_from_base(obs_prices, local_vol, base_model, teno
 
     return leverage_surface, diffs
 
-def calibrate_leverage_surface(obs_prices, tenors, strikes, s0, r_d, r_f, n_pde_tau, n_pde_strike, n_sim_paths, n_sim_steps):
+def calibrate_leverage_surface(obs_prices, tenors, strikes, s0, v0, r_d, r_f, kappa, max_xis, max_rhos, lambs,
+                               n_pde_tau, n_pde_strike, n_sim_paths, n_sim_steps):
     y_min = np.log(np.maximum(np.min(strikes) / s0 - 0.3, 1e-6))
     y_max = np.log(np.max(strikes) + 0.3)
 
     calibrated_local_vol = calibrate_local_vol(obs_prices, tenors, strikes, s0,  r_d, r_f,
                                                y_min, y_max, max(tenors), n_pde_tau, n_pde_strike)
 
+    base_model = MCStochasticVolModel(max(tenors), n_sim_paths, n_sim_steps, r_d, r_f, v0, s0, kappa,
+                                      PiecewiseTermStructure([1,2,3,5], max_rhos),
+                                      PiecewiseTermStructure([1,2,3,5], max_xis),
+                                      PiecewiseTermStructure([1,2,3,5], lambs))
 
-    base_model_params, base_model = calibrate_params(obs_price=obs_prices,
-                                                     tenors=tenors,
-                                                     strikes=strikes,
-                                                     n_paths=n_sim_paths,
-                                                     n_steps=n_sim_steps,
-                                                     r_d=r_d, r_f=r_f, s_0=s0, n_iters=60)
-
-    leverage_surface, _ = calibrate_leverage_surface_from_base(calibrated_local_vol,
-                                                            base_model, tenors, strikes, num_iters=100)
+    leverage_surface, _ = calibrate_leverage_surface_from_base(obs_prices, calibrated_local_vol,
+                                                               base_model, tenors, strikes, num_iters=100)
 
     s_sim, _ = simulate_with_leverage_surface(leverage_surface, tenors, strikes, base_model)
 
