@@ -76,6 +76,23 @@ class MCStochasticVolModel:
 
         return s_sim, v_sim
 
+def compute_barrier_pvs(s_sim: np.array, sim_times: np.array, r_d: float, tenors: np.array, strikes: np.array, B):
+    insert_idx = np.searchsorted(sim_times, tenors)
+
+    if min(insert_idx) == 0 or max(insert_idx) == len(sim_times):
+        raise ValueError("tenors out of simulation range")
+
+    assert np.abs(sim_times[insert_idx] - tenors).max() < 1e-8, "tenors not on simulation grid"
+
+    all_pvs = []
+    for i, idx in enumerate(insert_idx):
+        max_s = s_sim[:, idx].max(axis=1)
+        s_sim_adj = np.where(max_s < B, s_sim[:, idx], -1.0)
+        payoff = np.maximum(s_sim_adj - strikes, 0.0)
+        all_pvs.append(payoff.mean(axis=0) * np.exp(-r_d * tenors[i]))
+
+    return np.stack(all_pvs, axis=0)
+
 def compute_pvs(s_sim: np.array, sim_times: np.array, r_d: float, tenors: np.array, strikes: np.array):
     insert_idx = np.searchsorted(sim_times, tenors)
 
@@ -245,6 +262,8 @@ def calibrate_leverage_surface_from_base(obs_prices, local_vol, base_model, teno
     i = 0
     s_sim, v_sim = simulate_with_leverage_surface(leverage_surface, tenors, strikes, base_model)
     cond_exp = calc_stoch_var_cond_exp(s_sim, v_sim, base_model.times, tenors, strikes)
+    if np.isnan(cond_exp).any():
+        raise ValueError('bad initial condition')
     pvs = compute_pvs(s_sim, base_model.times, base_model.r_d, tenors, strikes)
     loss = np.sqrt(((pvs - obs_prices) ** 2).mean())
     while i < num_iters:
@@ -253,11 +272,12 @@ def calibrate_leverage_surface_from_base(obs_prices, local_vol, base_model, teno
         new_leverage_surface = (1 - lamb) * leverage_surface + lamb * local_vol / np.maximum(np.sqrt(cond_exp), 1e-6)
         s_sim, v_sim = simulate_with_leverage_surface(new_leverage_surface, tenors, strikes, base_model)
         cond_exp = calc_stoch_var_cond_exp(s_sim, v_sim, base_model.times, tenors, strikes)
-        if np.isnan(cond_exp.any()).any():
+        if np.isnan(cond_exp).any():
             lamb /= 2
             continue
         pvs = compute_pvs(s_sim, base_model.times, base_model.r_d, tenors, strikes)
         new_loss = np.sqrt(((pvs - obs_prices) ** 2).mean())
+
         if new_loss > loss:
             lamb /= 2
             continue
@@ -291,6 +311,10 @@ def calibrate_leverage_surface(obs_prices, tenors, strikes, s0, v0, r_d, r_f, ka
     est_pvs = compute_pvs(s_sim, base_model.times, r_d, tenors, strikes)
 
     return leverage_surface, est_pvs
+
+def calculate_barrier_pv(base_model, leverage_surface, tenors, strikes):
+    s_sim, v_sim = simulate_with_leverage_surface(leverage_surface, tenors, strikes, base_model)
+
 
 if __name__ == '__main__':
     # for quick local test
